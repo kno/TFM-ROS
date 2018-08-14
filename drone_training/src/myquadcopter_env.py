@@ -8,7 +8,8 @@ import tf
 import time
 from gym import utils, spaces
 from geometry_msgs.msg import Twist, Vector3Stamped, Pose
-from hector_uav_msgs.msg import Altimeter
+from nav_msgs.msg import Odometry
+#from hector_uav_msgs.msg import Altimeter
 from sensor_msgs.msg import Imu
 from std_msgs.msg import Empty as EmptyTopicMsg
 from gym.utils import seeding
@@ -18,8 +19,7 @@ from gazebo_connection import GazeboConnection
 #register the training environment in the gym as an available one
 reg = register(
     id='QuadcopterLiveShow-v0',
-    entry_point='myquadcopter_env:QuadCopterEnv',
-    timestep_limit=100,
+    entry_point='myquadcopter_env:QuadCopterEnv'
     )
 
 
@@ -31,7 +31,7 @@ class QuadCopterEnv(gym.Env):
         # before initialising the environment
         
         self.vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=5)
-        self.takeoff_pub = rospy.Publisher('/drone/takeoff', EmptyTopicMsg, queue_size=0)
+        self.takeoff_pub = rospy.Publisher('/ardrone/takeoff', EmptyTopicMsg, queue_size=0)
         
         # gets training parameters from param server
         self.speed_value = rospy.get_param("/speed_value")
@@ -42,22 +42,31 @@ class QuadCopterEnv(gym.Env):
         self.running_step = rospy.get_param("/running_step")
         self.max_incl = rospy.get_param("/max_incl")
         self.max_altitude = rospy.get_param("/max_altitude")
+        self.max_distance = rospy.get_param("/max_distance")
         
         # stablishes connection with simulator
         self.gazebo = GazeboConnection()
-        
-        self.action_space = spaces.Discrete(5) #Forward,Left,Right,Up,Down
+        high = np.array([
+            2000,
+            2000,
+            2000,
+            2000,
+            2000,
+            2000])
+        self.action_space = spaces.Discrete(6) #Forward,Left,Right,Up,Down,Back
+        self.observation_space = spaces.Box(-high, high)
         self.reward_range = (-np.inf, np.inf)
 
-        self._seed()
+        self.seed()
 
     # A function to initialize the random generator
-    def _seed(self, seed=None):
+    def seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
         return [seed]
-        
+    def render(self, mode=None):
+        None
     # Resets the state of the environment and returns an initial observation.
-    def _reset(self):
+    def reset(self):
         
         # 1st: resets the simulation to initial values
         self.gazebo.resetSim()
@@ -72,23 +81,32 @@ class QuadCopterEnv(gym.Env):
 
         # 4th: takes an observation of the initial condition of the robot
         data_pose, data_imu = self.take_observation()
-        observation = [data_pose.position.x]
+        observation = [int(round(data_pose.position.x*100)), int(round(data_pose.position.y*100)), int(round(data_pose.position.z*100)), int(round(self.desired_pose.position.x*100)), int(round(self.desired_pose.position.y*100)), int(round(self.desired_pose.position.z*100))]
         
         # 5th: pauses simulation
         self.gazebo.pauseSim()
 
+        with open("/root/catkin_ws/src/position.csv", "a") as myfile:
+            myfile.write("reset\n")
+        with open("/root/catkin_ws/src/distance.csv", "a") as myfile:
+            myfile.write("reset\n")
+
         return observation
 
-    def _step(self, action):
+    def step(self, action):
+        print("Action->" + str(action))
 
         # Given the action selected by the learning algorithm,
         # we perform the corresponding movement of the robot
         
         # 1st, we decide which velocity command corresponds
         vel_cmd = Twist()
+        vel_cmd.linear.x = 0.0
+        vel_cmd.linear.y = 0.0
+        vel_cmd.linear.z = 0.0
+        vel_cmd.angular.z = 0.0
         if action == 0: #FORWARD
             vel_cmd.linear.x = self.speed_value
-            vel_cmd.angular.z = 0.0
         elif action == 1: #LEFT
             vel_cmd.linear.x = 0.05
             vel_cmd.angular.z = self.speed_value
@@ -97,10 +115,10 @@ class QuadCopterEnv(gym.Env):
             vel_cmd.angular.z = -self.speed_value
         elif action == 3: #Up
             vel_cmd.linear.z = self.speed_value
-            vel_cmd.angular.z = 0.0
         elif action == 4: #Down
             vel_cmd.linear.z = -self.speed_value
-            vel_cmd.angular.z = 0.0
+        elif action == 5: #Back
+            vel_cmd.linear.x = 0#-self.speed_value
 
         # Then we send the command to the robot and let it go
         # for running_step seconds
@@ -115,15 +133,21 @@ class QuadCopterEnv(gym.Env):
 
         # Promote going forwards instead if turning
         if action == 0:
-            reward += 100
+            reward *= 2
         elif action == 1 or action == 2:
-            reward -= 50
-        elif action == 3:
-            reward -= 150
-        else:
-            reward -= 50
+            reward *= 0.75
+        elif action == 3 or action == 4:
+            reward *= 1.5
+        elif action == 5:
+            reward *= 2
 
-        state = [data_pose.position.x]
+        #state = [data_pose.position, self.desired_pose]
+        state = [int(round(data_pose.position.x*100)), int(round(data_pose.position.y*100)), int(round(data_pose.position.z*100)), int(round(self.desired_pose.position.x*100)), int(round(self.desired_pose.position.y*100)), int(round(self.desired_pose.position.z*100))]
+        #print "after step state"
+        print state
+        print reward
+        with open("/root/catkin_ws/src/position.csv", "a") as myfile:
+            myfile.write("{},{},{}\n".format(state[0], state[1], state[2] ))
         return state, reward, done, {}
 
 
@@ -131,16 +155,20 @@ class QuadCopterEnv(gym.Env):
         data_pose = None
         while data_pose is None:
             try:
-                data_pose = rospy.wait_for_message('/drone/gt_pose', Pose, timeout=5)
-            except:
-                rospy.loginfo("Current drone pose not ready yet, retrying for getting robot pose")
+#                data_pose = rospy.wait_for_message('/drone/gt_pose', Pose, timeout=5)
+                data_pose = rospy.wait_for_message('/ground_truth/state', Odometry, timeout=5)
+                data_pose = data_pose.pose.pose
+            except Exception as e:
+                None
+                #rospy.loginfo("Current drone pose not ready yet, retrying for getting robot pose {0}".format(e))
 
         data_imu = None
         while data_imu is None:
             try:
-                data_imu = rospy.wait_for_message('/drone/imu', Imu, timeout=5)
+                data_imu = rospy.wait_for_message('/ardrone/imu', Imu, timeout=5)
             except:
-                rospy.loginfo("Current drone imu not ready yet, retrying for getting robot imu")
+                None
+                #rospy.loginfo("Current drone imu not ready yet, retrying for getting robot imu")
         
         return data_pose, data_imu
 
@@ -154,11 +182,12 @@ class QuadCopterEnv(gym.Env):
 
 
     def init_desired_pose(self):
-        
+        rospy.loginfo("init_desired_pose starting")
         current_init_pose, imu = self.take_observation()
-        
+        rospy.loginfo("init_desired_pose after take_observation")
+        rospy.loginfo(current_init_pose);
         self.best_dist = self.calculate_dist_between_two_Points(current_init_pose.position, self.desired_pose.position)
-    
+        print(self.best_dist)
 
     def check_topic_publishers_connection(self):
         
@@ -183,8 +212,10 @@ class QuadCopterEnv(gym.Env):
 
 
     def takeoff_sequence(self, seconds_taking_off=1):
+        rospy.loginfo("Takeoff sequence starting")
         # Before taking off be sure that cmd_vel value there is is null to avoid drifts
         self.reset_cmd_vel_commands()
+        rospy.loginfo("Takeoff reset cmd_vel")
         
         takeoff_msg = EmptyTopicMsg()
         rospy.loginfo( "Taking-Off Start")
@@ -206,7 +237,7 @@ class QuadCopterEnv(gym.Env):
             reward = -100
             #print "Made Distance bigger= "+str(self.best_dist)
         
-        return reward
+        return reward, current_dist
         
     def process_data(self, data_position, data_imu):
 
@@ -226,6 +257,11 @@ class QuadCopterEnv(gym.Env):
             done = True
             reward = -200
         else:
-            reward = self.improved_distance_reward(data_position)
+            reward, distance = self.improved_distance_reward(data_position)
+            with open("/root/catkin_ws/src/distance.csv", "a") as myfile:
+                myfile.write("{}\n".format(distance))
+
+            if (distance > self.max_distance):
+                done = True
 
         return reward,done
